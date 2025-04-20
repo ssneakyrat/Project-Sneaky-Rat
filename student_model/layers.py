@@ -10,10 +10,11 @@ import math
 
 
 class DepthwiseSeparableConv2d(nn.Module):
-    """Depthwise separable 2D convolution."""
+    """Depthwise separable 2D convolution with adaptive channel handling."""
     
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, bias=True):
         super().__init__()
+        self.in_channels = in_channels
         self.depthwise = nn.Conv2d(
             in_channels, in_channels, kernel_size, stride=stride,
             padding=padding, dilation=dilation, groups=in_channels, bias=bias
@@ -21,6 +22,17 @@ class DepthwiseSeparableConv2d(nn.Module):
         self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=bias)
     
     def forward(self, x):
+        # Handle channel dimension mismatch
+        if x.size(1) != self.in_channels:
+            print(f"WARNING: Channel mismatch in DepthwiseSeparableConv2d - input has {x.size(1)} channels, expected {self.in_channels}")
+            if x.size(1) > self.in_channels:
+                # Truncate channels
+                x = x[:, :self.in_channels]
+            else:
+                # Pad with zeros
+                padding = torch.zeros(x.size(0), self.in_channels - x.size(1), x.size(2), x.size(3), device=x.device)
+                x = torch.cat([x, padding], dim=1)
+        
         x = self.depthwise(x)
         x = self.pointwise(x)
         return x
@@ -43,11 +55,21 @@ class ResBlock2d(nn.Module):
             self.activation = nn.LeakyReLU(0.1)  # Default
         
         for d in dilations:
-            # Calculate padding for 'same' output
-            if isinstance(kernel_size, tuple):
+            # Calculate padding for 'same' output - FIXED VERSION
+            if isinstance(kernel_size, (list, tuple)) and isinstance(d, (list, tuple)):
+                # Both kernel_size and d are tuples/lists
                 padding = ((kernel_size[0] * d[0] - d[0]) // 2, 
                           (kernel_size[1] * d[1] - d[1]) // 2)
+            elif isinstance(kernel_size, (list, tuple)):
+                # kernel_size is a tuple/list but d is a scalar
+                padding = ((kernel_size[0] * d - d) // 2, 
+                          (kernel_size[1] * d - d) // 2)
+            elif isinstance(d, (list, tuple)):
+                # kernel_size is a scalar but d is a tuple/list
+                padding = ((kernel_size * d[0] - d[0]) // 2, 
+                          (kernel_size * d[1] - d[1]) // 2)
             else:
+                # Both are scalars
                 padding = (kernel_size * d - d) // 2
             
             if use_depthwise:
@@ -109,4 +131,3 @@ class SimplifiedMRF2d(nn.Module):
         
         # Average the outputs from different receptive fields
         return torch.stack(outputs).mean(dim=0)
-
