@@ -86,6 +86,7 @@ class HiFiGANStudent2D(nn.Module):
         # Upsampling layers with channel adaptations
         self.upsamples = nn.ModuleList()
         self.channel_adaptations = nn.ModuleList()
+        self.post_mrf_adaptations = nn.ModuleList()  # NEW: Add post-MRF adaptations
         
         # Define channel progressions explicitly
         # Start with initial channel count
@@ -118,6 +119,19 @@ class HiFiGANStudent2D(nn.Module):
             self.channel_adaptations.append(
                 AdaptiveChannelLayer(out_channels, mrf_channels)
             )
+            
+            # NEW: Add post-MRF adaptation to prepare for next upsampling layer
+            # This adapts from the MRF output back to the expected channel count
+            if i < len(self.upsample_rates) - 1:  # Don't need an adapter after the last MRF
+                next_in_channels = upsample_channels[i+1]  # Channel count expected by next upsampling
+                self.post_mrf_adaptations.append(
+                    AdaptiveChannelLayer(mrf_channels, next_in_channels)
+                )
+            else:
+                # For the last layer, still create an adapter but it's identity (for consistent indexing)
+                self.post_mrf_adaptations.append(
+                    AdaptiveChannelLayer(mrf_channels, mrf_channels)
+                )
         
         # MRF blocks (all use the same mrf_channels value)
         self.mrfs = nn.ModuleList()
@@ -163,7 +177,14 @@ class HiFiGANStudent2D(nn.Module):
         x = self.conv_pre(x)
         
         # Upsampling stages with MRF blocks
-        for i, (up, adapt, mrf) in enumerate(zip(self.upsamples, self.channel_adaptations, self.mrfs)):
+        for i, (up, adapt, mrf, post_adapt) in enumerate(zip(
+            self.upsamples, self.channel_adaptations, self.mrfs, self.post_mrf_adaptations
+        )):
+            if i > 0:
+                # From the second iteration onward, we need to use the post-adaptation
+                # from the previous MRF to prepare for this upsampling
+                x = post_adapt(x)
+                
             # Apply upsampling
             x = up(x)
             
@@ -213,6 +234,13 @@ class HiFiGANStudent2D(nn.Module):
                     'index': i,
                     'shape': adapt.adaptation.weight.shape if hasattr(adapt, 'adaptation') else None
                 } for i, adapt in enumerate(self.channel_adaptations)
+            ],
+            'post_mrf_adaptations': [  # Add mapping info for new adaptations
+                {
+                    'type': 'post_mrf_adaptation',
+                    'index': i,
+                    'shape': adapt.adaptation.weight.shape if hasattr(adapt, 'adaptation') else None
+                } for i, adapt in enumerate(self.post_mrf_adaptations)
             ],
             'mrfs': [
                 {

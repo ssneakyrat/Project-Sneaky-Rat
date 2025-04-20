@@ -891,6 +891,7 @@ def map_weights_to_student(teacher_weights, student_model, teacher_arch_json):
 def apply_mapped_weights(student_model, mapped_weights):
     """
     Apply the mapped weights to the student model with improved channel handling.
+    Also initializes the new post-MRF adaptation layers.
     
     Args:
         student_model: Instance of student model
@@ -907,7 +908,7 @@ def apply_mapped_weights(student_model, mapped_weights):
     # Count how many weights were successfully mapped
     mapped_count = 0
     
-    # Explicitly handle channel adaptation layers first
+    # Explicitly handle channel adaptation layers
     if hasattr(student_model, 'channel_adaptations'):
         print("Initializing channel adaptation layers...")
         for i, adapt_layer in enumerate(student_model.channel_adaptations):
@@ -928,6 +929,41 @@ def apply_mapped_weights(student_model, mapped_weights):
                     state_dict[weight_name].copy_(weight)
                     print(f"  Initialized {weight_name} with identity-like mapping")
     
+    # Handle NEW post-MRF adaptation layers
+    if hasattr(student_model, 'post_mrf_adaptations'):
+        print("Initializing post-MRF adaptation layers...")
+        for i, adapt_layer in enumerate(student_model.post_mrf_adaptations):
+            if hasattr(adapt_layer, 'adaptation'):
+                # Initialize with identity-like mapping for adaptation
+                weight_name = f"post_mrf_adaptations.{i}.adaptation.weight"
+                if weight_name in state_dict:
+                    # Create identity-like mapping
+                    weight = torch.zeros_like(state_dict[weight_name])
+                    in_channels = adapt_layer.in_channels
+                    out_channels = adapt_layer.out_channels
+                    
+                    # For post-MRF layers, use a more sophisticated initialization
+                    # to better transform between the MRF output and next upsampling input
+                    if in_channels < out_channels:
+                        # Expanding channels - replicate each input channel to multiple output channels
+                        repeat_factor = out_channels // in_channels
+                        for c_in in range(in_channels):
+                            for r in range(repeat_factor):
+                                c_out = c_in * repeat_factor + r
+                                if c_out < out_channels:
+                                    weight[c_out, c_in] = 1.0 / repeat_factor
+                    else:
+                        # Reducing channels - average multiple input channels to fewer output channels
+                        for c_out in range(out_channels):
+                            channels_per_group = in_channels // out_channels
+                            start_idx = c_out * channels_per_group
+                            end_idx = start_idx + channels_per_group
+                            for c_in in range(start_idx, min(end_idx, in_channels)):
+                                weight[c_out, c_in] = 1.0 / channels_per_group
+                    
+                    state_dict[weight_name].copy_(weight)
+                    print(f"  Initialized {weight_name} with adaptive mapping")
+    
     # Handle final adaptation layer if it exists
     if hasattr(student_model, 'final_adaptation') and hasattr(student_model.final_adaptation, 'adaptation'):
         weight_name = "final_adaptation.adaptation.weight"
@@ -944,7 +980,7 @@ def apply_mapped_weights(student_model, mapped_weights):
             state_dict[weight_name].copy_(weight)
             print(f"  Initialized {weight_name} with identity-like mapping")
     
-    # Update weights that were mapped
+    # Update weights that were mapped from teacher
     for name, tensor in mapped_weights.items():
         if name in state_dict:
             # Check if shapes match
@@ -1022,16 +1058,17 @@ def apply_mapped_weights(student_model, mapped_weights):
     # Load the updated state dict back into the model
     student_model.load_state_dict(state_dict)
     return student_model
+
 def test_inference(model, dummy_input=None):
     """
-    Test inference with the model to ensure it works, with improved debugging.
+    Test inference with the model to ensure it works, with improved debugging and error handling.
     
     Args:
         model: PyTorch model to test
         dummy_input: Optional dummy input tensor
         
     Returns:
-        Output of model inference
+        Output of model inference or None if it fails
     """
     print("Testing inference with dummy data...")
     
@@ -1039,37 +1076,103 @@ def test_inference(model, dummy_input=None):
     if dummy_input is None:
         dummy_input = create_sample_input('2D', batch_size=1)
     
-    # Set model to evaluation mode
-    model.eval()
+    # Enable tensor tracking
+    activations = {}
     
-    # Enable tensor shape tracking
-    def hook_fn(module, input, output):
-        print(f"Module: {module.__class__.__name__}")
-        print(f"  Input shape: {[x.shape if isinstance(x, torch.Tensor) else type(x) for x in input]}")
-        print(f"  Output shape: {output.shape}")
-        return output
+    def hook_fn(name):
+        def _hook(module, input, output):
+            # For inputs, only log tensor shapes
+            input_shapes = [x.shape if isinstance(x, torch.Tensor) else type(x) for x in input]
+            
+            # For output, store the actual tensor for deeper analysis if needed
+            activations[name] = {
+                'input_shapes': input_shapes,
+                'output_shape': output.shape,
+                'output_channels': output.shape[1] if len(output.shape) >= 2 else None,
+                'output_stats': {
+                    'min': output.min().item(),
+                    'max': output.max().item(),
+                    'mean': output.mean().item(),
+                    'std': output.std().item()
+                }
+            }
+            return output
+        return _hook
     
-    # Register hooks for key modules
+    # Register hooks for key modules to track data flow
     hooks = []
+    print("\nRegistering hooks to track data flow...")
     for name, module in model.named_modules():
-        if isinstance(module, (nn.Conv2d, nn.Sequential)) or "adapt" in name.lower() or "mrf" in name.lower():
-            hook = module.register_forward_hook(hook_fn)
+        if (isinstance(module, nn.Conv2d) or 
+            isinstance(module, nn.Sequential) or 
+            'adapt' in name.lower() or 
+            'mrf' in name.lower() or
+            'upsample' in name.lower()):
+            
+            hook = module.register_forward_hook(hook_fn(name))
             hooks.append(hook)
+            print(f"  Added hook for: {name}")
     
     try:
+        # Set model to evaluation mode
+        model.eval()
+        
+        # Print input shape
+        print(f"\nInput shape: {dummy_input.shape}")
+        
         # Perform inference
         with torch.no_grad():
-            output = model(dummy_input)
-        
-        print(f"Inference successful! Output shape: {output.shape}")
-        return output
+            try:
+                output = model(dummy_input)
+                print(f"\nInference successful! Output shape: {output.shape}")
+                
+                # Print data flow summary
+                print("\nData flow summary:")
+                for i, (name, layer) in enumerate(activations.items()):
+                    if i < 10 or i > len(activations) - 10:  # Print first and last 10 only if there are many
+                        in_shape = "x".join(str(s) for s in layer['input_shapes'][0]) if layer['input_shapes'] else "N/A"
+                        out_shape = "x".join(str(s) for s in layer['output_shape'])
+                        print(f"  {name:<40} | Input: {in_shape:<20} | Output: {out_shape:<20}")
+                        
+                return output
+                
+            except RuntimeError as e:
+                print(f"\nInference failed with RuntimeError: {e}")
+                
+                # Find where the error happened by analyzing the last recorded shapes
+                print("\nData flow analysis up to the error point:")
+                for name, layer in activations.items():
+                    in_shape = "x".join(str(s) for s in layer['input_shapes'][0]) if layer['input_shapes'] else "N/A"
+                    out_shape = "x".join(str(s) for s in layer['output_shape'])
+                    channels_in = layer['input_shapes'][0][1] if layer['input_shapes'] and len(layer['input_shapes'][0]) > 1 else "N/A"
+                    channels_out = layer['output_channels'] if layer['output_channels'] is not None else "N/A"
+                    
+                    print(f"  {name:<40} | Channels: {channels_in}→{channels_out:<5} | {in_shape} → {out_shape}")
+                
+                # Provide detailed error analysis
+                error_str = str(e)
+                if "channels" in error_str:
+                    print("\nChannel mismatch detected in the error:")
+                    import re
+                    expected = re.search(r'expected input.*to have (\d+) channels', error_str)
+                    got = re.search(r'got (\d+) channels', error_str)
+                    if expected and got:
+                        print(f"  Expected channels: {expected.group(1)}")
+                        print(f"  Received channels: {got.group(1)}")
+                        print("\nPossible issues:")
+                        print("  1. Channel adaptation layer not properly handling the transformation")
+                        print("  2. Weight dimensions not compatible with data flow")
+                        print("  3. Forward pass skipping a necessary adaptation layer")
+                
+                return None
     except Exception as e:
-        print(f"Inference failed with error: {e}")
-        raise
+        print(f"\nUnexpected error during inference: {e}")
+        return None
     finally:
-        # Remove hooks
+        # Remove hooks to avoid memory leaks
         for hook in hooks:
             hook.remove()
+            
 def main(onnx_path, student_arch_json, output_path):
     """
     Main function to map weights and test the student model.

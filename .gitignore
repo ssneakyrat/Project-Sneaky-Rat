@@ -3,3 +3,4 @@ cache/
 *.ipynb
 *.onnx
 *.pyc
+*.pt
