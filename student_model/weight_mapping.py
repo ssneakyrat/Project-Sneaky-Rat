@@ -11,6 +11,7 @@ import os
 import json
 from pathlib import Path
 import torch.nn.functional as F
+import torch.nn as nn
 import warnings
 
 # Suppress the non-writable NumPy array warning
