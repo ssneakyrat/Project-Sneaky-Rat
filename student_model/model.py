@@ -23,7 +23,16 @@ class HiFiGANStudent2D(nn.Module):
         
         self.config = config
         self.input_channels = getattr(config, 'input_channels', 1)
+        
+        # Handle the case where upsample_rates is a single integer (0)
         self.upsample_rates = config.upsample_rates
+        if isinstance(self.upsample_rates, int):
+            # Convert to list with default values if it's 0
+            if self.upsample_rates == 0:
+                self.upsample_rates = [8, 8, 4, 4]
+            else:
+                self.upsample_rates = [self.upsample_rates] * len(config.upsample_kernel_sizes)
+        
         self.upsample_kernel_sizes = config.upsample_kernel_sizes
         self.upsample_initial_channel = config.upsample_initial_channel
         self.resblock_kernel_sizes = config.resblock_kernel_sizes

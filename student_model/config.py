@@ -12,7 +12,8 @@ class StudentConfig:
     conv_type = '2D'
     input_channels = 1
     base_channels = 32
-    upsample_rates = 0
+    # Fixed the upsampling rates to be a list instead of an integer
+    upsample_rates = [8, 8, 4, 4]  # Default upsampling rates
     upsample_kernel_sizes = [[8, 8], [8, 8], [4, 4], [4, 4]]
     upsample_initial_channel = 256
     resblock_kernel_sizes = [[3, 3], [5, 5], [7, 7]]

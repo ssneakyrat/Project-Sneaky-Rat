@@ -2,3 +2,4 @@ results/
 cache/
 *.ipynb
 *.onnx
+*.pyc
