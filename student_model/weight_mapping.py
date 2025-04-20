@@ -27,6 +27,547 @@ from student_model.utils import (
     save_model_info
 )
 
+def improved_weight_mapping(teacher_weights, student_model):
+    """
+    Improved weight mapping strategy that uses pattern matching and structural similarity
+    to map weights from teacher to student model.
+    
+    Args:
+        teacher_weights: Dictionary of teacher weights
+        student_model: Instance of student model
+        
+    Returns:
+        Dictionary of mapped weights keyed by student layer names
+    """
+    print("Starting improved weight mapping process...")
+    
+    # Print debug information about the teacher weights
+    print("\nDEBUG: Teacher Model Weights Analysis")
+    print("=" * 50)
+    print(f"Total teacher weights: {len(teacher_weights)}")
+    
+    # Group weights by prefix to understand structure
+    prefix_groups = {}
+    for name in teacher_weights.keys():
+        parts = name.split('.')
+        if len(parts) >= 2:
+            prefix = parts[0] + '.' + parts[1]
+            if prefix not in prefix_groups:
+                prefix_groups[prefix] = []
+            prefix_groups[prefix].append(name)
+    
+    print("Found the following weight groups in teacher model:")
+    for prefix, weights in prefix_groups.items():
+        print(f"  - {prefix}: {len(weights)} weights")
+    print("=" * 50)
+    
+    # Dictionary to store mapped weights
+    mapped_weights = {}
+    
+    # Map initial convolution (conv_pre)
+    print("\nMapping initial convolution layer...")
+    initial_conv_candidates = []
+    
+    # Look for potential initial convolution weights
+    for name, tensor in teacher_weights.items():
+        # Initial convolutions are typically larger and at the beginning of the model
+        if ('weight' in name and 
+            len(tensor.shape) == 4 and  # 2D convolution
+            tensor.shape[2] >= 5 and    # Kernel size at least 5x5
+            'conv' in name.lower() and  # Contains 'conv' in name
+            ('initial' in name.lower() or 'pre' in name.lower() or 'first' in name.lower() or
+             any(s in name.lower() for s in ['in_', 'input', 'begin', 'start']))):
+            initial_conv_candidates.append((name, tensor))
+    
+    # If no specific candidates found, look for any initial layers
+    if not initial_conv_candidates:
+        for name, tensor in teacher_weights.items():
+            if ('weight' in name and 
+                len(tensor.shape) == 4 and  # 2D convolution
+                ('generator.conv' in name or  # Common pattern in HiFi-GAN
+                 'generator.m_source' in name or
+                 'generator.initial' in name)):
+                initial_conv_candidates.append((name, tensor))
+    
+    # If still no candidates, look for any conv with appropriate shape
+    if not initial_conv_candidates:
+        for name, tensor in teacher_weights.items():
+            if ('weight' in name and 
+                len(tensor.shape) == 4 and  # 2D convolution
+                tensor.shape[1] <= 2):      # Input channels typically small
+                initial_conv_candidates.append((name, tensor))
+    
+    if initial_conv_candidates:
+        # Sort candidates by shape similarity to student conv_pre
+        student_shape = student_model.conv_pre.weight.shape
+        initial_conv_candidates.sort(key=lambda x: shape_similarity_score(x[1].shape, student_shape))
+        
+        # Use the best candidate
+        best_name, best_tensor = initial_conv_candidates[0]
+        print(f"Selected '{best_name}' as initial convolution weight")
+        
+        # Reshape if needed
+        if best_tensor.shape != student_shape:
+            if len(best_tensor.shape) == len(student_shape):
+                reshaped = adaptive_reshape(best_tensor, student_shape)
+                mapped_weights['conv_pre.weight'] = reshaped
+            else:
+                print(f"Warning: Cannot reshape from {best_tensor.shape} to {student_shape}")
+                mapped_weights['conv_pre.weight'] = student_model.conv_pre.weight.clone()
+        else:
+            mapped_weights['conv_pre.weight'] = best_tensor
+    else:
+        print("No suitable initial convolution weights found. Using random initialization.")
+        mapped_weights['conv_pre.weight'] = student_model.conv_pre.weight.clone()
+    
+    # Map upsampling layers
+    print("\nMapping upsampling layers...")
+    
+    # Look for potential upsampling convolution weights
+    upsampling_candidates = []
+    
+    # HiFi-GAN typically uses a series of transposed convolutions for upsampling
+    for name, tensor in teacher_weights.items():
+        if ('weight' in name and 
+            len(tensor.shape) == 4 and
+            ('transpose' in name.lower() or 
+             'up' in name.lower() or 
+             'upsample' in name.lower() or
+             # Common naming patterns in HiFi-GAN models
+             'generator.ups' in name or
+             'generator.resblocks' in name)):
+            upsampling_candidates.append((name, tensor))
+    
+    # Group upsampling candidates by similarity
+    upsampling_groups = []
+    for name, tensor in upsampling_candidates:
+        # Check if this tensor belongs to an existing group
+        found_group = False
+        for group in upsampling_groups:
+            ref_shape = teacher_weights[group[0][0]].shape
+            if tensor.shape[0] == ref_shape[0] or tensor.shape[1] == ref_shape[1]:
+                group.append((name, tensor))
+                found_group = True
+                break
+        
+        if not found_group:
+            # Create a new group
+            upsampling_groups.append([(name, tensor)])
+    
+    # Sort groups by likely order in model
+    upsampling_groups.sort(key=lambda group: (
+        # Larger input channel dimension usually means earlier in the network
+        -teacher_weights[group[0][0]].shape[1],
+        group[0][0]  # Use name as secondary sort key
+    ))
+    
+    # Map upsampling layers
+    for i, up_layer in enumerate(student_model.upsamples):
+        if i < len(upsampling_groups) and upsampling_groups[i]:
+            # Find best matching weight in this group
+            student_shape = up_layer[1].weight.shape
+            candidates = upsampling_groups[i]
+            candidates.sort(key=lambda x: shape_similarity_score(x[1].shape, student_shape))
+            
+            best_name, best_tensor = candidates[0]
+            print(f"Selected '{best_name}' for upsampling layer {i}")
+            
+            # Reshape if needed
+            if best_tensor.shape != student_shape:
+                reshaped = adaptive_reshape(best_tensor, student_shape)
+                mapped_weights[f"upsamples.{i}.1.weight"] = reshaped
+            else:
+                mapped_weights[f"upsamples.{i}.1.weight"] = best_tensor
+        else:
+            print(f"No suitable weights found for upsampling layer {i}. Using random initialization.")
+            mapped_weights[f"upsamples.{i}.1.weight"] = up_layer[1].weight.clone()
+    
+    # Map MRF blocks
+    print("\nMapping MRF blocks...")
+    
+    # Identify potential resblock weights (usually the largest group of weights)
+    resblock_weights = []
+    for name, tensor in teacher_weights.items():
+        if ('weight' in name and 
+            len(tensor.shape) == 4 and
+            ('resblock' in name.lower() or 
+             'res_block' in name.lower() or
+             'conv_block' in name.lower() or
+             'generator.resblocks' in name or
+             'dilation' in name.lower())):
+            resblock_weights.append((name, tensor))
+    
+    # Group by block pattern (usually blocks have same number of layers with different dilation)
+    block_patterns = {}
+    for name, tensor in resblock_weights:
+        # Extract pattern from name (e.g., "generator.resblocks.0.1.2")
+        parts = name.split('.')
+        if len(parts) >= 3:
+            pattern_key = '.'.join(parts[:-2])  # Group by module name without specific layer
+            if pattern_key not in block_patterns:
+                block_patterns[pattern_key] = []
+            block_patterns[pattern_key].append((name, tensor))
+    
+    # Sort block patterns by size (larger blocks usually more important)
+    sorted_patterns = sorted(block_patterns.items(), key=lambda x: len(x[1]), reverse=True)
+    
+    # Map to student MRF blocks
+    for i, mrf in enumerate(student_model.mrfs):
+        print(f"Mapping MRF block {i}...")
+        
+        # Map each resblock in the MRF
+        for k, resblock in enumerate(mrf.resblocks):
+            # Try to find matching weights for this resblock
+            matched_weights = False
+            
+            # Search for weights with matching shape
+            for pattern_key, pattern_weights in sorted_patterns:
+                if matched_weights:
+                    break
+                    
+                # Check if this pattern has weights for all convolutions in the resblock
+                if len(pattern_weights) >= len(resblock.convs):
+                    # Group by likely layer position in the resblock
+                    layer_groups = {}
+                    for weight_name, weight_tensor in pattern_weights:
+                        parts = weight_name.split('.')
+                        if len(parts) >= 4:
+                            # Use the last numeric part as layer identifier
+                            layer_id = parts[-2]
+                            if layer_id not in layer_groups:
+                                layer_groups[layer_id] = []
+                            layer_groups[layer_id].append((weight_name, weight_tensor))
+                    
+                    # Sort layer groups by name
+                    sorted_layers = sorted(layer_groups.items())
+                    
+                    # Try to map each conv in the resblock
+                    if len(sorted_layers) >= len(resblock.convs):
+                        matched_weights = True
+                        
+                        for j, conv in enumerate(resblock.convs):
+                            if j < len(sorted_layers):
+                                _, layer_weights = sorted_layers[j]
+                                
+                                # Sort weights by name similarity to find weight and bias
+                                layer_weights.sort(key=lambda x: x[0])
+                                
+                                if layer_weights:
+                                    weight_name, weight_tensor = layer_weights[0]
+                                    print(f"  Using '{weight_name}' for MRF {i}, resblock {k}, conv {j}")
+                                    
+                                    # Handle depthwise separable convolution
+                                    if hasattr(conv, 'depthwise'):
+                                        # Split weight for depthwise and pointwise
+                                        depthwise_shape = conv.depthwise.weight.shape
+                                        pointwise_shape = conv.pointwise.weight.shape
+                                        
+                                        # Create depthwise weight
+                                        depthwise = adaptive_reshape(weight_tensor, depthwise_shape)
+                                        mapped_weights[f"mrfs.{i}.resblocks.{k}.convs.{j}.depthwise.weight"] = depthwise
+                                        
+                                        # Create pointwise weight (identity mapping if possible)
+                                        in_channels = depthwise_shape[0]
+                                        pointwise = torch.zeros(pointwise_shape)
+                                        for c in range(min(pointwise_shape[0], in_channels)):
+                                            pointwise[c, c % in_channels] = 1.0
+                                        
+                                        mapped_weights[f"mrfs.{i}.resblocks.{k}.convs.{j}.pointwise.weight"] = pointwise
+                                    else:
+                                        # Standard convolution
+                                        student_shape = conv.weight.shape
+                                        reshaped = adaptive_reshape(weight_tensor, student_shape)
+                                        mapped_weights[f"mrfs.{i}.resblocks.{k}.convs.{j}.weight"] = reshaped
+                            else:
+                                print(f"  Not enough layer weights for MRF {i}, resblock {k}, conv {j}")
+                                matched_weights = False
+            
+            # If no weights were matched for this resblock
+            if not matched_weights:
+                print(f"  No matching weights found for MRF {i}, resblock {k}")
+                for j, conv in enumerate(resblock.convs):
+                    if hasattr(conv, 'depthwise'):
+                        mapped_weights[f"mrfs.{i}.resblocks.{k}.convs.{j}.depthwise.weight"] = conv.depthwise.weight.clone()
+                        mapped_weights[f"mrfs.{i}.resblocks.{k}.convs.{j}.pointwise.weight"] = conv.pointwise.weight.clone()
+                    else:
+                        mapped_weights[f"mrfs.{i}.resblocks.{k}.convs.{j}.weight"] = conv.weight.clone()
+    
+    # Map output convolution
+    print("\nMapping output convolution layer...")
+    output_candidates = []
+    
+    # Look for potential output convolutions
+    for name, tensor in teacher_weights.items():
+        if ('weight' in name and 
+            len(tensor.shape) == 4 and
+            tensor.shape[0] == 1 and  # Output typically has 1 channel
+            ('output' in name.lower() or 
+             'out_' in name.lower() or 
+             'final' in name.lower() or
+             'post' in name.lower() or
+             'last' in name.lower())):
+            output_candidates.append((name, tensor))
+    
+    # If no specific candidates found, look for layer that outputs 1 channel
+    if not output_candidates:
+        for name, tensor in teacher_weights.items():
+            if ('weight' in name and 
+                len(tensor.shape) == 4 and
+                tensor.shape[0] == 1):  # Output channel is 1
+                output_candidates.append((name, tensor))
+    
+    if output_candidates:
+        # Sort candidates by shape similarity
+        student_shape = student_model.conv_post.weight.shape
+        output_candidates.sort(key=lambda x: shape_similarity_score(x[1].shape, student_shape))
+        
+        best_name, best_tensor = output_candidates[0]
+        print(f"Selected '{best_name}' as output convolution weight")
+        
+        # Reshape if needed
+        if best_tensor.shape != student_shape:
+            reshaped = adaptive_reshape(best_tensor, student_shape)
+            mapped_weights['conv_post.weight'] = reshaped
+        else:
+            mapped_weights['conv_post.weight'] = best_tensor
+    else:
+        print("No suitable output convolution weights found. Using random initialization.")
+        mapped_weights['conv_post.weight'] = student_model.conv_post.weight.clone()
+    
+    print(f"\nCompleted mapping process with {len(mapped_weights)} mapped layers")
+    return mapped_weights
+
+def shape_similarity_score(shape1, shape2):
+    """
+    Calculate a similarity score between two tensor shapes.
+    Lower score means more similar.
+    
+    Args:
+        shape1: First tensor shape
+        shape2: Second tensor shape
+        
+    Returns:
+        Similarity score (lower is more similar)
+    """
+    if len(shape1) != len(shape2):
+        return 1000  # Very different
+    
+    # Calculate normalized difference for each dimension
+    score = 0
+    for s1, s2 in zip(shape1, shape2):
+        # Calculate relative difference
+        if s1 == 0 and s2 == 0:
+            diff = 0
+        elif s1 == 0 or s2 == 0:
+            diff = 1
+        else:
+            diff = abs(s1 - s2) / max(s1, s2)
+        score += diff
+    
+    return score
+
+def improved_initial_mapping(teacher_weights, student_model):
+    """Improved mapping for the initial convolution layer specifically."""
+    print("\nMapping initial convolution layer with specialized approach...")
+    student_shape = student_model.conv_pre.weight.shape
+    
+    # First check for the most likely candidates by name
+    candidates = []
+    
+    # Known common initial convolution names in HiFi-GAN
+    likely_names = [
+        'generator.conv_pre.weight',
+        'generator.input_conv.weight',
+        'generator.first_conv.weight'
+    ]
+    
+    for name in likely_names:
+        if name in teacher_weights:
+            candidates.append((name, teacher_weights[name]))
+            print(f"Found exact match: {name}")
+    
+    # If no exact matches, try pattern matching
+    if not candidates:
+        for name, tensor in teacher_weights.items():
+            # Check common patterns in HiFi-GAN models
+            if (('weight' in name) and 
+                ('conv_pre' in name or 'input_conv' in name or 'first_conv' in name)):
+                candidates.append((name, tensor))
+                print(f"Found pattern match: {name}")
+    
+    # If still no candidates, look for any Conv2D with size info that makes sense for input
+    if not candidates:
+        for name, tensor in teacher_weights.items():
+            if ('weight' in name and len(tensor.shape) == 4):
+                # Initial convolution typically has small input channels (1-3)
+                if tensor.shape[1] <= 3:
+                    candidates.append((name, tensor))
+                    print(f"Found potential initial conv by shape: {name} {tensor.shape}")
+    
+    # Check for 'generator.conv_pre.weight' specifically (common in HiFi-GAN)
+    if 'generator.conv_pre.weight' in teacher_weights:
+        print("Using 'generator.conv_pre.weight' as this is the standard initial conv in HiFi-GAN")
+        conv_weight = teacher_weights['generator.conv_pre.weight']
+        return robust_reshape(conv_weight, student_shape)
+    
+    # If we have candidates, choose the best one
+    if candidates:
+        # Prioritize candidates with kernel size >= 3
+        valid_candidates = [c for c in candidates if (
+            c[1].shape[2] >= 3 and c[1].shape[3] >= 3)]
+        
+        if valid_candidates:
+            candidates = valid_candidates
+        
+        # Choose the one with closest shape to target
+        name, tensor = candidates[0]
+        print(f"Selected '{name}' for initial convolution with shape {tensor.shape}")
+        return robust_reshape(tensor, student_shape)
+    
+    # Fallback - if no suitable convolutions found, initialize randomly
+    print(f"No suitable initial convolution found, initializing randomly")
+    import torch.nn as nn
+    init_tensor = torch.zeros(student_shape)
+    nn.init.kaiming_normal_(init_tensor)
+    return init_tensor
+
+def robust_reshape(tensor, target_shape):
+    """
+    Robustly reshape a tensor to the target shape, even for challenging cases.
+    """
+    print(f"Reshaping tensor from {tensor.shape} to {target_shape}")
+    
+    # Special case for the problematic initial tensor
+    if tensor.shape == torch.Size([1, 1, 2, 1]) and target_shape == torch.Size([256, 1, 7, 7]):
+        print("Using special handling for [1,1,2,1] -> [256,1,7,7] case")
+        # Create new tensor with target shape
+        result = torch.zeros(target_shape)
+        
+        # Fill with values derived from the source but properly scaled
+        # Copy the values in a pattern that expands to fill the target shape
+        for i in range(256):
+            for h in range(7):
+                for w in range(7):
+                    # Use modulo to cycle through the source values
+                    src_h = h % tensor.shape[2]
+                    src_w = w % tensor.shape[3]
+                    value = tensor[0, 0, src_h, src_w].item()
+                    
+                    # Scale the value based on position to create variation
+                    scale = 0.5 + (i % 5) * 0.1  # Some variation by output channel
+                    result[i, 0, h, w] = value * scale
+        
+        # Normalize to have similar statistics as the source
+        src_mean = tensor.mean().item()
+        src_std = tensor.std().item() or 0.01  # Fallback if std is 0
+        
+        result_mean = result.mean().item()
+        result_std = result.std().item() or 0.01
+        
+        # Adjust to match statistics
+        result = (result - result_mean) / result_std * src_std + src_mean
+        
+        return result
+    
+    # For all other cases, use the more general adaptive_reshape
+    return adaptive_reshape(tensor, target_shape)
+
+def adaptive_reshape(tensor, target_shape):
+    """
+    Adaptively reshape a tensor to match the target shape,
+    handling different dimensionality and sizes.
+    
+    Args:
+        tensor: Source tensor
+        target_shape: Target shape
+        
+    Returns:
+        Reshaped tensor
+    """
+    import torch
+    import torch.nn.functional as F
+    
+    # Check if shapes already match
+    if tensor.shape == target_shape:
+        return tensor
+    
+    # Create new tensor with target shape
+    reshaped = torch.zeros(target_shape, dtype=tensor.dtype)
+    
+    # Handle different dimensionality cases
+    if len(tensor.shape) != len(target_shape):
+        print(f"Warning: Dimension mismatch between tensor {tensor.shape} and target {target_shape}")
+        
+        # Case: Convert from 3D to 4D (or similar dimension changes)
+        if len(tensor.shape) == 3 and len(target_shape) == 4:
+            # Try to transform the 3D tensor to 4D
+            t_expanded = tensor.unsqueeze(2)  # Convert [N,C,L] -> [N,C,1,L]
+            
+            # Check if we can reinterpret the dimensions
+            if t_expanded.shape[0] == target_shape[0]:  # Output channels match
+                # Initialize result with zeros
+                out_c, in_c, kh, kw = target_shape
+                
+                # Copy available weights
+                min_in_c = min(t_expanded.shape[1], in_c)
+                min_kh = min(t_expanded.shape[2], kh)
+                min_kw = min(t_expanded.shape[3], kw)
+                
+                # Copy what we can
+                reshaped[:, :min_in_c, :min_kh, :min_kw] = t_expanded[:, :min_in_c, :min_kh, :min_kw]
+                
+                return reshaped
+        
+        # If we reach here, we'll create a random initialization with proper statistics
+        print(f"Using randomized initialization for {target_shape} with statistics from source tensor")
+        mean = tensor.mean().item()
+        std = tensor.std().item() or 0.01  # Fallback to small std if 0
+        
+        import torch.nn.init as init
+        init.normal_(reshaped, mean=mean, std=std)
+        return reshaped
+    
+    # Handle spatial dimensions (last two for 4D tensors)
+    if len(tensor.shape) == 4 and len(target_shape) == 4:
+        # Get channel dimensions
+        out_c, in_c, kh, kw = target_shape
+        src_out_c, src_in_c, src_kh, src_kw = tensor.shape
+        
+        # Try spatial interpolation if the kernel shapes are valid for interpolation
+        if src_kh > 1 and src_kw > 1 and kh > 1 and kw > 1:
+            try:
+                temp = F.interpolate(
+                    tensor.unsqueeze(0),
+                    size=(kh, kw),
+                    mode='bilinear'
+                ).squeeze(0)
+                
+                # Handle channel dimensions
+                min_out_c = min(src_out_c, out_c)
+                min_in_c = min(src_in_c, in_c)
+                
+                # Copy data with channel adaption
+                reshaped[:min_out_c, :min_in_c] = temp[:min_out_c, :min_in_c]
+            except (ValueError, RuntimeError) as e:
+                print(f"Interpolation failed: {e}")
+                # Fallback to simple copy of available values
+                min_out_c = min(src_out_c, out_c)
+                min_in_c = min(src_in_c, in_c)
+                min_kh = min(src_kh, kh)
+                min_kw = min(src_kw, kw)
+                
+                reshaped[:min_out_c, :min_in_c, :min_kh, :min_kw] = tensor[:min_out_c, :min_in_c, :min_kh, :min_kw]
+        else:
+            # Source or target has singleton dimensions, use direct copy
+            min_out_c = min(src_out_c, out_c)
+            min_in_c = min(src_in_c, in_c)
+            min_kh = min(src_kh, kh)
+            min_kw = min(src_kw, kw)
+            
+            reshaped[:min_out_c, :min_in_c, :min_kh, :min_kw] = tensor[:min_out_c, :min_in_c, :min_kh, :min_kw]
+    
+    return reshaped
+
 def extract_weights_from_onnx(onnx_path):
     """
     Extract weights from ONNX model into a dictionary.
@@ -462,8 +1003,148 @@ def main(onnx_path, student_arch_json, output_path):
     print("Initializing student model...")
     student_model = HiFiGANStudent2D()
     
-    # Map weights from teacher to student
-    mapped_weights = map_weights_to_student(teacher_weights, student_model, student_arch_json)
+    # Use improved weight mapping strategy
+    print("\n" + "="*50)
+    print("USING IMPROVED WEIGHT MAPPING STRATEGY")
+    print("="*50)
+    
+    # Create a dictionary to store mapped weights
+    mapped_weights = {}
+    
+    # Print debug information about the teacher weights
+    print("\nDEBUG: Teacher Model Weights Analysis")
+    print("=" * 50)
+    print(f"Total teacher weights: {len(teacher_weights)}")
+    
+    # Group weights by prefix to understand structure
+    prefix_groups = {}
+    for name in teacher_weights.keys():
+        parts = name.split('.')
+        if len(parts) >= 2:
+            prefix = parts[0] + '.' + parts[1]
+            if prefix not in prefix_groups:
+                prefix_groups[prefix] = []
+            prefix_groups[prefix].append(name)
+    
+    print("Found the following weight groups in teacher model:")
+    for prefix, weights in prefix_groups.items():
+        print(f"  - {prefix}: {len(weights)} weights")
+    print("=" * 50)
+    
+    # Map initial convolution using specialized approach
+    mapped_weights['conv_pre.weight'] = improved_initial_mapping(teacher_weights, student_model)
+    
+    # Map upsampling layers
+    print("\nMapping upsampling layers...")
+    # Get specific upsampling weights from the HiFi-GAN model
+    ups_weights = [(name, tensor) for name, tensor in teacher_weights.items() 
+                  if 'generator.ups' in name and 'weight' in name]
+    
+    # Sort by the numerical part of the name (e.g., generator.ups.0.weight)
+    ups_weights.sort(key=lambda x: int(x[0].split('.')[2]) if x[0].split('.')[2].isdigit() else 999)
+    
+    # Map to student upsampling layers
+    for i, up_layer in enumerate(student_model.upsamples):
+        if i < len(ups_weights):
+            name, tensor = ups_weights[i]
+            print(f"Mapping upsampling layer {i} from {name} {tensor.shape}")
+            
+            # Get the convolution weight after upsampling
+            student_shape = up_layer[1].weight.shape
+            mapped_weights[f"upsamples.{i}.1.weight"] = adaptive_reshape(tensor, student_shape)
+        else:
+            print(f"No matching weight found for upsampling layer {i}, using random initialization")
+            mapped_weights[f"upsamples.{i}.1.weight"] = up_layer[1].weight.clone()
+    
+    # Map MRF blocks
+    print("\nMapping MRF blocks...")
+    # Get resblock weights from the HiFi-GAN model
+    resblock_weights = [(name, tensor) for name, tensor in teacher_weights.items() 
+                       if 'generator.resblocks' in name and 'weight' in name]
+    
+    # Group by resblock number
+    resblock_groups = {}
+    for name, tensor in resblock_weights:
+        parts = name.split('.')
+        if len(parts) >= 3 and parts[2].isdigit():
+            group_key = int(parts[2])
+            if group_key not in resblock_groups:
+                resblock_groups[group_key] = []
+            resblock_groups[group_key].append((name, tensor))
+    
+    # Sort groups by resblock number
+    sorted_groups = sorted(resblock_groups.items())
+    
+    # Map to student MRF blocks
+    for i, mrf in enumerate(student_model.mrfs):
+        print(f"Mapping MRF block {i}...")
+        if i < len(sorted_groups):
+            _, group_weights = sorted_groups[i]
+            
+            # Map each resblock in the MRF
+            for k, resblock in enumerate(mrf.resblocks):
+                # Calculate how many teacher weights to use per student resblock
+                weights_per_resblock = len(group_weights) // len(mrf.resblocks)
+                start_idx = k * weights_per_resblock
+                end_idx = start_idx + weights_per_resblock
+                
+                # Get weights for this resblock
+                rb_weights = group_weights[start_idx:end_idx]
+                
+                # Map convolutions
+                for j, conv in enumerate(resblock.convs):
+                    if j < len(rb_weights):
+                        name, tensor = rb_weights[j]
+                        print(f"  Mapping MRF {i}, resblock {k}, conv {j} from {name} {tensor.shape}")
+                        
+                        # Handle depthwise separable convolution
+                        if hasattr(conv, 'depthwise'):
+                            # Split the weight for depthwise and pointwise
+                            depthwise_shape = conv.depthwise.weight.shape
+                            pointwise_shape = conv.pointwise.weight.shape
+                            
+                            # Map depthwise
+                            mapped_weights[f"mrfs.{i}.resblocks.{k}.convs.{j}.depthwise.weight"] = adaptive_reshape(tensor, depthwise_shape)
+                            
+                            # Create identity-like pointwise weight
+                            in_channels = depthwise_shape[0]
+                            pointwise = torch.zeros(pointwise_shape)
+                            for c in range(min(pointwise_shape[0], in_channels)):
+                                pointwise[c, c % in_channels] = 1.0
+                            
+                            mapped_weights[f"mrfs.{i}.resblocks.{k}.convs.{j}.pointwise.weight"] = pointwise
+                        else:
+                            # Standard convolution
+                            student_shape = conv.weight.shape
+                            mapped_weights[f"mrfs.{i}.resblocks.{k}.convs.{j}.weight"] = adaptive_reshape(tensor, student_shape)
+                    else:
+                        print(f"  No matching weight for MRF {i}, resblock {k}, conv {j}, using random initialization")
+                        if hasattr(conv, 'depthwise'):
+                            mapped_weights[f"mrfs.{i}.resblocks.{k}.convs.{j}.depthwise.weight"] = conv.depthwise.weight.clone()
+                            mapped_weights[f"mrfs.{i}.resblocks.{k}.convs.{j}.pointwise.weight"] = conv.pointwise.weight.clone()
+                        else:
+                            mapped_weights[f"mrfs.{i}.resblocks.{k}.convs.{j}.weight"] = conv.weight.clone()
+        else:
+            print(f"No matching weights for MRF block {i}, using random initialization")
+            for k, resblock in enumerate(mrf.resblocks):
+                for j, conv in enumerate(resblock.convs):
+                    if hasattr(conv, 'depthwise'):
+                        mapped_weights[f"mrfs.{i}.resblocks.{k}.convs.{j}.depthwise.weight"] = conv.depthwise.weight.clone()
+                        mapped_weights[f"mrfs.{i}.resblocks.{k}.convs.{j}.pointwise.weight"] = conv.pointwise.weight.clone()
+                    else:
+                        mapped_weights[f"mrfs.{i}.resblocks.{k}.convs.{j}.weight"] = conv.weight.clone()
+    
+    # Map output convolution
+    print("\nMapping output convolution layer...")
+    if 'generator.conv_post.weight' in teacher_weights:
+        print("Using 'generator.conv_post.weight' for output convolution")
+        output_shape = student_model.conv_post.weight.shape
+        mapped_weights['conv_post.weight'] = adaptive_reshape(teacher_weights['generator.conv_post.weight'], output_shape)
+    else:
+        print("No suitable output convolution weight found, using random initialization")
+        mapped_weights['conv_post.weight'] = student_model.conv_post.weight.clone()
+    
+    print(f"\nCompleted mapping process with {len(mapped_weights)} mapped layers")
     
     # Apply mapped weights to student model
     student_model = apply_mapped_weights(student_model, mapped_weights)

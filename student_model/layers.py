@@ -92,6 +92,21 @@ class ResBlock2d(nn.Module):
             residual = x
             x = self.activation(x)
             x = conv(x)
+            
+            # Handle channel dimension mismatch between residual and processed output
+            if x.size(1) != residual.size(1):
+                print(f"Handling channel mismatch in ResBlock2d: output has {x.size(1)} channels, residual has {residual.size(1)}")
+                if x.size(1) < residual.size(1):
+                    # Truncate channels from residual to match x
+                    residual = residual[:, :x.size(1)]
+                else:
+                    # Pad residual with zeros to match x
+                    padding = torch.zeros(
+                        residual.size(0), x.size(1) - residual.size(1),
+                        residual.size(2), residual.size(3), device=residual.device
+                    )
+                    residual = torch.cat([residual, padding], dim=1)
+            
             x = x + residual
         return x
 
