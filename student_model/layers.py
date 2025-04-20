@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""
+layers.py - Custom layers for the student HiFi-GAN model.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+class DepthwiseSeparableConv2d(nn.Module):
+    """Depthwise separable 2D convolution."""
+    
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, bias=True):
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            in_channels, in_channels, kernel_size, stride=stride,
+            padding=padding, dilation=dilation, groups=in_channels, bias=bias
+        )
+        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=bias)
+    
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        return x
+
+
+class ResBlock2d(nn.Module):
+    """Residual block with multiple dilated 2D convolutions."""
+    
+    def __init__(self, channels, kernel_size, dilations, use_depthwise=False, activation='LeakyRelu'):
+        super().__init__()
+        self.convs = nn.ModuleList()
+        self.use_depthwise = use_depthwise
+        
+        # Select activation function
+        if activation == 'LeakyRelu':
+            self.activation = nn.LeakyReLU(0.1)
+        elif activation == 'Relu':
+            self.activation = nn.ReLU()
+        else:
+            self.activation = nn.LeakyReLU(0.1)  # Default
+        
+        for d in dilations:
+            # Calculate padding for 'same' output
+            if isinstance(kernel_size, tuple):
+                padding = ((kernel_size[0] * d[0] - d[0]) // 2, 
+                          (kernel_size[1] * d[1] - d[1]) // 2)
+            else:
+                padding = (kernel_size * d - d) // 2
+            
+            if use_depthwise:
+                self.convs.append(
+                    DepthwiseSeparableConv2d(
+                        channels, channels, kernel_size,
+                        dilation=d, padding=padding
+                    )
+                )
+            else:
+                self.convs.append(
+                    nn.Conv2d(
+                        channels, channels, kernel_size,
+                        dilation=d, padding=padding
+                    )
+                )
+    
+    def forward(self, x):
+        for conv in self.convs:
+            residual = x
+            x = self.activation(x)
+            x = conv(x)
+            x = x + residual
+        return x
+
+
+class SimplifiedMRF2d(nn.Module):
+    """Simplified Multi-Receptive Field Fusion module with 2D convolutions."""
+    
+    def __init__(self, channels, kernel_sizes, dilations, use_depthwise=False, activation='LeakyRelu'):
+        super().__init__()
+        self.resblocks = nn.ModuleList()
+        
+        for k, d in zip(kernel_sizes, dilations):
+            self.resblocks.append(ResBlock2d(channels, k, d, use_depthwise, activation))
+        
+        # Initialize weights
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        for resblock in self.resblocks:
+            for conv in resblock.convs:
+                if isinstance(conv, nn.Conv2d):
+                    nn.init.kaiming_normal_(conv.weight)
+                    if conv.bias is not None:
+                        nn.init.zeros_(conv.bias)
+                elif hasattr(conv, 'depthwise'):
+                    nn.init.kaiming_normal_(conv.depthwise.weight)
+                    if conv.depthwise.bias is not None:
+                        nn.init.zeros_(conv.depthwise.bias)
+                    nn.init.kaiming_normal_(conv.pointwise.weight)
+                    if conv.pointwise.bias is not None:
+                        nn.init.zeros_(conv.pointwise.bias)
+    
+    def forward(self, x):
+        outputs = []
+        for resblock in self.resblocks:
+            outputs.append(resblock(x))
+        
+        # Average the outputs from different receptive fields
+        return torch.stack(outputs).mean(dim=0)
+
