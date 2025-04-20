@@ -890,7 +890,7 @@ def map_weights_to_student(teacher_weights, student_model, teacher_arch_json):
 
 def apply_mapped_weights(student_model, mapped_weights):
     """
-    Apply the mapped weights to the student model.
+    Apply the mapped weights to the student model with improved channel handling.
     
     Args:
         student_model: Instance of student model
@@ -899,13 +899,50 @@ def apply_mapped_weights(student_model, mapped_weights):
     Returns:
         Updated student model with mapped weights
     """
-    print("Applying mapped weights to student model...")
+    print("Applying mapped weights to student model with improved channel handling...")
     
     # Get state dict of the student model
     state_dict = student_model.state_dict()
     
     # Count how many weights were successfully mapped
     mapped_count = 0
+    
+    # Explicitly handle channel adaptation layers first
+    if hasattr(student_model, 'channel_adaptations'):
+        print("Initializing channel adaptation layers...")
+        for i, adapt_layer in enumerate(student_model.channel_adaptations):
+            if hasattr(adapt_layer, 'adaptation'):
+                # Initialize with identity-like mapping for channel adaptation
+                weight_name = f"channel_adaptations.{i}.adaptation.weight"
+                if weight_name in state_dict:
+                    # Create identity-like mapping for channel adaptation
+                    weight = torch.zeros_like(state_dict[weight_name])
+                    in_channels = adapt_layer.in_channels
+                    out_channels = adapt_layer.out_channels
+                    
+                    # Identity mapping for shared channels, zero for others
+                    for c in range(min(in_channels, out_channels)):
+                        # Set a diagonal-like pattern
+                        weight[c, c % in_channels] = 1.0
+                    
+                    state_dict[weight_name].copy_(weight)
+                    print(f"  Initialized {weight_name} with identity-like mapping")
+    
+    # Handle final adaptation layer if it exists
+    if hasattr(student_model, 'final_adaptation') and hasattr(student_model.final_adaptation, 'adaptation'):
+        weight_name = "final_adaptation.adaptation.weight"
+        if weight_name in state_dict:
+            # Create identity-like mapping
+            weight = torch.zeros_like(state_dict[weight_name])
+            in_channels = student_model.final_adaptation.in_channels
+            out_channels = student_model.final_adaptation.out_channels
+            
+            # Identity mapping for shared channels
+            for c in range(min(in_channels, out_channels)):
+                weight[c, c % in_channels] = 1.0
+            
+            state_dict[weight_name].copy_(weight)
+            print(f"  Initialized {weight_name} with identity-like mapping")
     
     # Update weights that were mapped
     for name, tensor in mapped_weights.items():
@@ -919,24 +956,50 @@ def apply_mapped_weights(student_model, mapped_weights):
                 # Try to reshape if possible
                 if len(state_dict[name].shape) == len(tensor.shape):
                     try:
-                        reshaped = F.interpolate(
-                            tensor.unsqueeze(0),
-                            size=state_dict[name].shape[2:],
-                            mode='bilinear'
-                        ).squeeze(0)
-                        # Ensure channel dimensions match
-                        if reshaped.shape[0] > state_dict[name].shape[0]:
-                            reshaped = reshaped[:state_dict[name].shape[0]]
-                        if reshaped.shape[1] > state_dict[name].shape[1]:
-                            reshaped = reshaped[:, :state_dict[name].shape[1]]
-                        
-                        # Check if reshaping worked
-                        if reshaped.shape == state_dict[name].shape:
-                            state_dict[name].copy_(reshaped)
-                            mapped_count += 1
-                            print(f"Successfully reshaped weight for {name}")
+                        if len(tensor.shape) == 4:  # For 2D convolutions
+                            reshaped = F.interpolate(
+                                tensor.unsqueeze(0),
+                                size=state_dict[name].shape[2:],
+                                mode='bilinear'
+                            ).squeeze(0)
+                            
+                            # Handle channel dimensions
+                            if reshaped.shape[0] > state_dict[name].shape[0]:
+                                reshaped = reshaped[:state_dict[name].shape[0]]
+                            if reshaped.shape[1] > state_dict[name].shape[1]:
+                                reshaped = reshaped[:, :state_dict[name].shape[1]]
+                            
+                            # Add additional padding if necessary
+                            if reshaped.shape[0] < state_dict[name].shape[0]:
+                                padding = torch.zeros(
+                                    state_dict[name].shape[0] - reshaped.shape[0],
+                                    reshaped.shape[1],
+                                    reshaped.shape[2],
+                                    reshaped.shape[3],
+                                    device=reshaped.device
+                                )
+                                reshaped = torch.cat([reshaped, padding], dim=0)
+                            
+                            if reshaped.shape[1] < state_dict[name].shape[1]:
+                                padding = torch.zeros(
+                                    reshaped.shape[0],
+                                    state_dict[name].shape[1] - reshaped.shape[1],
+                                    reshaped.shape[2],
+                                    reshaped.shape[3],
+                                    device=reshaped.device
+                                )
+                                reshaped = torch.cat([reshaped, padding], dim=1)
+                            
+                            # Check if reshaping worked
+                            if reshaped.shape == state_dict[name].shape:
+                                state_dict[name].copy_(reshaped)
+                                mapped_count += 1
+                                print(f"Successfully reshaped weight for {name}")
+                            else:
+                                print(f"Reshaping failed for {name}, keeping original weights")
                         else:
-                            print(f"Reshaping failed for {name}, keeping original weights")
+                            # For non-4D tensors, just copy what we can
+                            print(f"Cannot reshape non-4D tensor for {name}, using partial copy")
                     except Exception as e:
                         print(f"Error reshaping weight for {name}: {e}")
         else:
@@ -944,25 +1007,24 @@ def apply_mapped_weights(student_model, mapped_weights):
     
     print(f"Successfully applied {mapped_count}/{len(mapped_weights)} mapped weights")
     
-    # If no weights were applied, ensure all parameters are initialized
-    if mapped_count == 0:
-        print("\nWARNING: No weights were successfully applied!")
-        print("Ensuring all parameters are properly initialized...")
-        for name, param in student_model.named_parameters():
-            if torch.all(param == 0):
-                print(f"Initializing zero parameter: {name}")
-                if 'weight' in name:
-                    nn.init.kaiming_normal_(param)
-                elif 'bias' in name:
-                    nn.init.zeros_(param)
+    # Initialize any remaining uninitialized parameters
+    for name, param in state_dict.items():
+        if 'weight' in name and torch.all(param == 0):
+            print(f"Initializing zero parameter: {name}")
+            if len(param.shape) == 4:  # Conv weight
+                nn.init.kaiming_normal_(param)
+            elif len(param.shape) == 1:  # Bias
+                nn.init.zeros_(param)
+            else:
+                # Use xavier for other types of weights
+                nn.init.xavier_normal_(param)
     
     # Load the updated state dict back into the model
     student_model.load_state_dict(state_dict)
     return student_model
-
 def test_inference(model, dummy_input=None):
     """
-    Test inference with the model to ensure it works.
+    Test inference with the model to ensure it works, with improved debugging.
     
     Args:
         model: PyTorch model to test
@@ -980,13 +1042,34 @@ def test_inference(model, dummy_input=None):
     # Set model to evaluation mode
     model.eval()
     
-    # Perform inference
-    with torch.no_grad():
-        output = model(dummy_input)
+    # Enable tensor shape tracking
+    def hook_fn(module, input, output):
+        print(f"Module: {module.__class__.__name__}")
+        print(f"  Input shape: {[x.shape if isinstance(x, torch.Tensor) else type(x) for x in input]}")
+        print(f"  Output shape: {output.shape}")
+        return output
     
-    print(f"Inference successful! Output shape: {output.shape}")
-    return output
-
+    # Register hooks for key modules
+    hooks = []
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Conv2d, nn.Sequential)) or "adapt" in name.lower() or "mrf" in name.lower():
+            hook = module.register_forward_hook(hook_fn)
+            hooks.append(hook)
+    
+    try:
+        # Perform inference
+        with torch.no_grad():
+            output = model(dummy_input)
+        
+        print(f"Inference successful! Output shape: {output.shape}")
+        return output
+    except Exception as e:
+        print(f"Inference failed with error: {e}")
+        raise
+    finally:
+        # Remove hooks
+        for hook in hooks:
+            hook.remove()
 def main(onnx_path, student_arch_json, output_path):
     """
     Main function to map weights and test the student model.

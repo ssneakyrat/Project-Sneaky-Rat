@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-model.py - Student HiFi-GAN model implementation.
+model.py - Student HiFi-GAN model implementation with fixed channel handling.
 """
 
 import torch
@@ -8,6 +8,38 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .config import StudentConfig
 from .layers import DepthwiseSeparableConv2d, ResBlock2d, SimplifiedMRF2d
+
+
+class AdaptiveChannelLayer(nn.Module):
+    """
+    Adapts channel dimensions between layers to ensure compatibility.
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.needs_adaptation = in_channels != out_channels
+        
+        if self.needs_adaptation:
+            self.adaptation = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+    
+    def forward(self, x):
+        if not self.needs_adaptation:
+            return x
+            
+        # Check input channels and adapt if needed
+        if x.size(1) != self.in_channels:
+            print(f"AdaptiveChannelLayer: Input has {x.size(1)} channels, expected {self.in_channels}")
+            if x.size(1) > self.in_channels:
+                # Truncate channels
+                x = x[:, :self.in_channels]
+            else:
+                # Pad with zeros
+                padding = torch.zeros(x.size(0), self.in_channels - x.size(1), 
+                                     x.size(2), x.size(3), device=x.device)
+                x = torch.cat([x, padding], dim=1)
+                
+        return self.adaptation(x)
 
 
 class HiFiGANStudent2D(nn.Module):
@@ -51,12 +83,25 @@ class HiFiGANStudent2D(nn.Module):
         # Initial convolution
         self.conv_pre = nn.Conv2d(self.input_channels, self.upsample_initial_channel, (7, 7), 1, padding=(3, 3))
         
-        # Upsampling layers
+        # Upsampling layers with channel adaptations
         self.upsamples = nn.ModuleList()
-        in_channels = self.upsample_initial_channel
+        self.channel_adaptations = nn.ModuleList()
+        
+        # Define channel progressions explicitly
+        # Start with initial channel count
+        upsample_channels = [self.upsample_initial_channel]
+        
+        # Calculate each subsequent layer's channel count (halve each time)
+        for i in range(len(self.upsample_rates)):
+            upsample_channels.append(upsample_channels[-1] // 2)
+            
+        # MRF block channel counts (fixed to 16 for all blocks)
+        mrf_channels = 16
+        
+        # Now create the layers with proper channel handling
         for i, (u, k) in enumerate(zip(self.upsample_rates, self.upsample_kernel_sizes)):
-            # Calculate output channels for this stage
-            out_channels = in_channels // 2
+            in_channels = upsample_channels[i]
+            out_channels = upsample_channels[i+1]
             
             # Calculate appropriate padding
             padding = ((k[0]-1)//2, (k[1]-1)//2)
@@ -68,15 +113,18 @@ class HiFiGANStudent2D(nn.Module):
                     nn.Conv2d(in_channels, out_channels, k, 1, padding=padding)
                 )
             )
-            in_channels = out_channels
+            
+            # Add channel adaptation layer between upsample output and MRF block
+            self.channel_adaptations.append(
+                AdaptiveChannelLayer(out_channels, mrf_channels)
+            )
         
-        # MRF blocks
+        # MRF blocks (all use the same mrf_channels value)
         self.mrfs = nn.ModuleList()
         for i in range(len(self.upsample_rates)):
-            channels = in_channels
             self.mrfs.append(
                 SimplifiedMRF2d(
-                    channels,
+                    mrf_channels,
                     self.resblock_kernel_sizes,
                     self.resblock_dilation_sizes,
                     self.use_depthwise_separable,
@@ -84,8 +132,11 @@ class HiFiGANStudent2D(nn.Module):
                 )
             )
             
+        # Add final channel adaptation before output conv
+        self.final_adaptation = AdaptiveChannelLayer(mrf_channels, mrf_channels)
+            
         # Output convolution
-        self.conv_post = nn.Conv2d(in_channels, 1, (7, 7), 1, padding=(3, 3))
+        self.conv_post = nn.Conv2d(mrf_channels, 1, (7, 7), 1, padding=(3, 3))
         
         # Initialize weights
         self.reset_parameters()
@@ -112,9 +163,18 @@ class HiFiGANStudent2D(nn.Module):
         x = self.conv_pre(x)
         
         # Upsampling stages with MRF blocks
-        for i, (up, mrf) in enumerate(zip(self.upsamples, self.mrfs)):
+        for i, (up, adapt, mrf) in enumerate(zip(self.upsamples, self.channel_adaptations, self.mrfs)):
+            # Apply upsampling
             x = up(x)
+            
+            # Adapt channels for MRF block
+            x = adapt(x)
+            
+            # Apply MRF block
             x = mrf(x)
+        
+        # Final channel adaptation
+        x = self.final_adaptation(x)
         
         # Final convolution and activation
         x = self.activation(x)
@@ -147,6 +207,13 @@ class HiFiGANStudent2D(nn.Module):
                     'shape': up[1].weight.shape  # The conv after upsampling
                 } for i, up in enumerate(self.upsamples)
             ],
+            'channel_adaptations': [
+                {
+                    'type': 'adaptation',
+                    'index': i,
+                    'shape': adapt.adaptation.weight.shape if hasattr(adapt, 'adaptation') else None
+                } for i, adapt in enumerate(self.channel_adaptations)
+            ],
             'mrfs': [
                 {
                     'type': 'mrf',
@@ -165,6 +232,10 @@ class HiFiGANStudent2D(nn.Module):
                     ]
                 } for i, mrf in enumerate(self.mrfs)
             ],
+            'final_adaptation': {
+                'type': 'adaptation',
+                'shape': self.final_adaptation.adaptation.weight.shape if hasattr(self.final_adaptation, 'adaptation') else None
+            },
             'conv_post': {
                 'type': 'output',
                 'shape': self.conv_post.weight.shape
